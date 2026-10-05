@@ -1,0 +1,925 @@
+openapi: 3.0.3
+info:
+  title: 临期食品捐赠预约冷链凭证服务
+  description: |
+    连锁烘焙门店临期食品捐赠预约与冷链凭证服务。
+
+    **核心业务流**：门店闭店前上报可捐赠批次 → 公益机构按服务半径/接收能力/冷链能力预约 →
+    门店确认生成待交接清单 → 取货扫码核对（箱号/温度/封签/接收人身份）→ 机构签收上传配送计划 →
+    分站点发放并回执 → 受助点反馈。每个批次沉淀 来源/温控/交接/配送/发放 五类哈希链凭证，
+    支撑监管抽查与品牌风险控制。
+
+    **异常场景**：门店临时售罄、超过可捐赠时限、冷链车迟到、机构爽约、箱号错扫、
+    过敏原缺失、受助点反馈变质、监管抽查。
+
+    **一致性设计**：
+    - 同一批次重复预约：Redis 分布式锁 + 数据库部分唯一索引 + Idempotency-Key 三重防重；
+    - 批次状态机由数据库守卫迁移（乐观并发）；
+    - 捐赠公示与发放同事务落库，Kafka 事件经 outbox 可靠投递用于投影与审计。
+  version: 1.0.0
+  contact:
+    name: Platform Team
+servers:
+  - url: http://localhost:8080
+    description: 本地
+tags:
+  - name: auth
+  - name: batches
+  - name: reservations
+  - name: handover
+  - name: delivery
+  - name: exceptions
+  - name: audit
+  - name: admin
+
+paths:
+  /healthz:
+    get:
+      summary: 健康检查
+      security: []
+      responses:
+        '200': { description: 正常 }
+
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: 登录获取令牌
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string, example: store1.manager }
+                password: { type: string, example: Store@123 }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+                  user: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /api/v1/me:
+    get:
+      tags: [auth]
+      summary: 当前用户
+      responses:
+        '200':
+          description: 当前登录用户
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+
+  /api/v1/stores:
+    get:
+      tags: [batches]
+      summary: 门店列表
+      responses:
+        '200':
+          description: 门店列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stores:
+                    type: array
+                    items: { $ref: '#/components/schemas/Store' }
+
+  /api/v1/charities:
+    get:
+      tags: [batches]
+      summary: 公益机构列表（含服务半径/接收能力/冷链能力）
+      responses:
+        '200':
+          description: 机构列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  charities:
+                    type: array
+                    items: { $ref: '#/components/schemas/Charity' }
+
+  /api/v1/stores/{storeId}/batches:
+    post:
+      tags: [batches]
+      summary: 门店闭店前上报可捐赠批次（自动生成箱号与来源凭证）
+      parameters:
+        - { name: storeId, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReportBatchRequest' }
+      responses:
+        '201':
+          description: 上报成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch: { $ref: '#/components/schemas/Batch' }
+                  boxes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Box' }
+        '400': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/batches:
+    get:
+      tags: [batches]
+      summary: 批次列表
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/BatchStatus' } }
+        - { name: store_id, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: 批次列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batches:
+                    type: array
+                    items: { $ref: '#/components/schemas/Batch' }
+
+  /api/v1/batches/{id}:
+    get:
+      tags: [batches]
+      summary: 批次详情（含箱与当前预约）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch: { $ref: '#/components/schemas/Batch' }
+                  boxes: { type: array, items: { $ref: '#/components/schemas/Box' } }
+                  reservation: { $ref: '#/components/schemas/Reservation' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /api/v1/batches/{id}/allergens:
+    patch:
+      tags: [batches]
+      summary: 门店补充确认过敏原信息（解除预约阻断）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [allergens]
+              properties:
+                allergens:
+                  type: array
+                  items: { type: string }
+                  example: ["gluten", "egg", "milk"]
+      responses:
+        '200':
+          description: 已确认
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch: { $ref: '#/components/schemas/Batch' }
+
+  /api/v1/batches/{id}/reserve:
+    post:
+      tags: [reservations]
+      summary: |
+        公益机构预约批次。规则：服务半径、当日接收能力、冷链车辆与冷链容量、
+        取货时限、过敏原必须已确认；大批量释放（≥机构日能力50%）要求 3 小时内取货。
+        幂等：Idempotency-Key 请求头去重；同批次仅允许一条生效预约。
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+          description: 幂等键，重试安全
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReserveRequest' }
+      responses:
+        '201':
+          description: 预约成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationResponse' }
+        '200':
+          description: 幂等重放，返回首次结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReservationResponse' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/reservations/{id}:
+    get:
+      tags: [reservations]
+      summary: 预约详情
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 预约详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservation: { $ref: '#/components/schemas/Reservation' }
+
+  /api/v1/reservations/{id}/confirm:
+    post:
+      tags: [reservations]
+      summary: 门店店长确认预约（生成待交接清单）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 已确认
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservation: { $ref: '#/components/schemas/Reservation' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /api/v1/reservations/{id}/cancel:
+    post:
+      tags: [reservations]
+      summary: 取消预约（批次回到可预约池或过期）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+      responses:
+        '200':
+          description: 已取消
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservation: { $ref: '#/components/schemas/Reservation' }
+
+  /api/v1/reservations/{id}/handover-list:
+    get:
+      tags: [handover]
+      summary: 待交接清单（预约 + 批次 + 全部箱号及扫码状态）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 待交接清单
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservation: { $ref: '#/components/schemas/Reservation' }
+                  batch: { $ref: '#/components/schemas/Batch' }
+                  boxes: { type: array, items: { $ref: '#/components/schemas/Box' } }
+
+  /api/v1/reservations/{id}/handover/start:
+    post:
+      tags: [handover]
+      summary: 开始交接（幂等，重复调用返回已有交接单）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '201':
+          description: 交接单
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  handover: { $ref: '#/components/schemas/Handover' }
+
+  /api/v1/reservations/{id}/handover/scan:
+    post:
+      tags: [handover]
+      summary: |
+        取货扫码核对：箱号必须属于本批次（错扫记录 wrong_scan 异常）、
+        温度超标记录 temp_breach 异常；同箱号重复扫码幂等返回首扫结果。
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [box_no]
+              properties:
+                box_no: { type: string, example: B20261004-00001-BOX-001 }
+                temp_c: { type: number, example: 5.5 }
+                seal_intact: { type: boolean, example: true }
+      responses:
+        '201':
+          description: 扫码成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scan: { $ref: '#/components/schemas/HandoverScan' }
+        '200':
+          description: 幂等重放/错扫/重复记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scan: { $ref: '#/components/schemas/HandoverScan' }
+
+  /api/v1/reservations/{id}/handover/complete:
+    post:
+      tags: [handover]
+      summary: 完成交接（全部箱已扫码 + 接收人身份核验 + 整体温度与封签）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [receiver_name, receiver_id_no, seal_intact]
+              properties:
+                receiver_name: { type: string }
+                receiver_id_no: { type: string }
+                overall_temp_c: { type: number }
+                seal_intact: { type: boolean }
+      responses:
+        '200':
+          description: 交接完成
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  handover: { $ref: '#/components/schemas/Handover' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/reservations/{id}/handover/scans:
+    get:
+      tags: [handover]
+      summary: 交接扫码记录
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 扫码记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scans:
+                    type: array
+                    items: { $ref: '#/components/schemas/HandoverScan' }
+
+  /api/v1/reservations/{id}/delivery-plan:
+    post:
+      tags: [delivery]
+      summary: 机构签收后上传配送计划（车辆 + 站点 + 受助对象类型，箱数须与交接一致）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeliveryPlanRequest' }
+      responses:
+        '201':
+          description: 配送计划
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plan: { $ref: '#/components/schemas/DeliveryPlan' }
+                  stops:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryStop' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /api/v1/reservations/{id}/delivery:
+    get:
+      tags: [delivery]
+      summary: 配送计划与发放记录
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 配送详情
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plan: { $ref: '#/components/schemas/DeliveryPlan' }
+                  stops: { type: array, items: { $ref: '#/components/schemas/DeliveryStop' } }
+                  distributions: { type: array, items: { $ref: '#/components/schemas/Distribution' } }
+
+  /api/v1/delivery-stops/{id}/complete:
+    post:
+      tags: [delivery]
+      summary: 完成站点发放（幂等；全部站点完成后批次闭环并生成公示）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [boxes, receiver_sign]
+              properties:
+                boxes: { type: integer }
+                receiver_sign: { type: string }
+      responses:
+        '200':
+          description: 发放记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  distribution: { $ref: '#/components/schemas/Distribution' }
+                  batch_distributed: { type: boolean }
+
+  /api/v1/distributions/{id}/feedback:
+    post:
+      tags: [delivery]
+      summary: 受助点反馈（spoiled 触发变质异常并标记箱状态）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [ok, spoiled] }
+                note: { type: string }
+      responses:
+        '200':
+          description: 已记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  distribution: { $ref: '#/components/schemas/Distribution' }
+
+  /api/v1/batches/{id}/exceptions:
+    post:
+      tags: [exceptions]
+      summary: |
+        上报业务异常：sold_out(门店临时售罄，取消批次与预约) /
+        no_show(机构爽约，批次过期) / truck_late(冷链车迟到，仅记录) /
+        regulatory_check(监管抽查留痕)。
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type:
+                  type: string
+                  enum: [sold_out, no_show, truck_late, regulatory_check]
+                detail:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '201':
+          description: 异常已记录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exception: { $ref: '#/components/schemas/Exception' }
+
+  /api/v1/exceptions:
+    get:
+      tags: [exceptions]
+      summary: 异常列表
+      parameters:
+        - { name: batch_id, in: query, schema: { type: integer } }
+        - { name: status, in: query, schema: { type: string, enum: [open, resolved] } }
+      responses:
+        '200':
+          description: 异常列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exceptions:
+                    type: array
+                    items: { $ref: '#/components/schemas/Exception' }
+
+  /api/v1/exceptions/{id}/resolve:
+    post:
+      tags: [exceptions]
+      summary: 关闭异常（监管/管理员/涉事方）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resolution]
+              properties:
+                resolution: { type: string }
+      responses:
+        '200':
+          description: 已关闭
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exception: { $ref: '#/components/schemas/Exception' }
+
+  /api/v1/batches/{id}/vouchers:
+    get:
+      tags: [audit]
+      summary: 批次凭证链（来源/预约/确认/交接/配送/发放/异常/闭环，哈希链）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 凭证链
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  vouchers:
+                    type: array
+                    items: { $ref: '#/components/schemas/Voucher' }
+                  chain_valid: { type: boolean }
+
+  /api/v1/batches/{id}/audit:
+    get:
+      tags: [audit]
+      summary: 监管抽查：批次全链路审计轨迹（凭证链实时重算校验）
+      parameters:
+        - { $ref: '#/components/parameters/id' }
+      responses:
+        '200':
+          description: 审计轨迹
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/publicity/donations:
+    get:
+      tags: [audit]
+      summary: 捐赠公示（公开，无需认证）
+      security: []
+      responses:
+        '200':
+          description: 公示列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  donations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Publicity' }
+
+  /api/v1/admin/jobs/expire:
+    post:
+      tags: [admin]
+      summary: 手动触发过期巡检（管理员；正常由后台任务周期执行）
+      responses:
+        '200':
+          description: 处理数量
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  processed: { type: integer }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: token
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+  responses:
+    Error:
+      description: 错误响应
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        display_name: { type: string }
+        role:
+          type: string
+          enum: [store_staff, store_manager, charity_staff, regulator, admin]
+        store_id: { type: integer }
+        charity_id: { type: integer }
+    Store:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string }
+        name: { type: string }
+        address: { type: string }
+        lat: { type: number }
+        lng: { type: number }
+        contact_phone: { type: string }
+    Charity:
+      type: object
+      properties:
+        id: { type: integer }
+        code: { type: string }
+        name: { type: string }
+        service_radius_km: { type: number }
+        daily_capacity_boxes: { type: integer }
+        cold_chain_vehicles: { type: integer }
+        cold_chain_capacity_boxes: { type: integer }
+        recipient_types:
+          type: array
+          items: { type: string }
+    BatchStatus:
+      type: string
+      enum: [reported, reserved, confirmed, handover, handed_over, in_delivery, distributed, cancelled, expired]
+    Batch:
+      type: object
+      properties:
+        id: { type: integer }
+        batch_no: { type: string }
+        store_id: { type: integer }
+        status: { $ref: '#/components/schemas/BatchStatus' }
+        category: { type: string }
+        total_boxes: { type: integer }
+        produced_at: { type: string, format: date-time }
+        shelf_life_hours: { type: integer }
+        expires_at: { type: string, format: date-time }
+        allergens:
+          type: array
+          items: { type: string }
+        allergen_confirmed: { type: boolean }
+        requires_cold_chain: { type: boolean }
+        storage_temp_max_c: { type: number }
+        packaging: { type: string, enum: [intact, minor_damage, damaged] }
+        latest_pickup_at: { type: string, format: date-time }
+    Box:
+      type: object
+      properties:
+        id: { type: integer }
+        batch_id: { type: integer }
+        box_no: { type: string }
+        status:
+          type: string
+          enum: [pending, scanned, handed_over, in_delivery, distributed, spoiled, missing]
+    ReportBatchRequest:
+      type: object
+      required: [category, total_boxes, produced_at, shelf_life_hours, latest_pickup_at]
+      properties:
+        category: { type: string, example: 面包糕点 }
+        description: { type: string }
+        total_boxes: { type: integer, example: 6 }
+        quantity_desc: { type: string, example: 每箱约20个 }
+        produced_at: { type: string, format: date-time }
+        shelf_life_hours: { type: integer, example: 36 }
+        allergens:
+          type: array
+          items: { type: string }
+          example: ["gluten", "egg", "milk"]
+        allergen_confirmed: { type: boolean }
+        requires_cold_chain: { type: boolean }
+        storage_temp_max_c: { type: number, example: 8 }
+        packaging: { type: string, enum: [intact, minor_damage, damaged] }
+        address: { type: string }
+        lat: { type: number }
+        lng: { type: number }
+        latest_pickup_at: { type: string, format: date-time }
+        notes: { type: string }
+    ReserveRequest:
+      type: object
+      required: [charity_id, boxes, planned_pickup_at]
+      properties:
+        charity_id: { type: integer }
+        boxes: { type: integer }
+        planned_pickup_at: { type: string, format: date-time }
+        vehicle_plate: { type: string }
+        driver_name: { type: string }
+        cold_chain: { type: boolean }
+        receiver_name: { type: string }
+        receiver_phone: { type: string }
+        receiver_id_no: { type: string }
+    Reservation:
+      type: object
+      properties:
+        id: { type: integer }
+        reservation_no: { type: string }
+        batch_id: { type: integer }
+        charity_id: { type: integer }
+        status:
+          type: string
+          enum: [pending, confirmed, cancelled, expired, completed]
+        boxes: { type: integer }
+        planned_pickup_at: { type: string, format: date-time }
+        vehicle_plate: { type: string }
+        cold_chain: { type: boolean }
+        receiver_name: { type: string }
+        cancel_reason: { type: string }
+    ReservationResponse:
+      type: object
+      properties:
+        reservation: { $ref: '#/components/schemas/Reservation' }
+        idempotent_replay: { type: boolean }
+    Handover:
+      type: object
+      properties:
+        id: { type: integer }
+        reservation_id: { type: integer }
+        status: { type: string, enum: [in_progress, completed, aborted] }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        overall_temp_c: { type: number }
+        seal_intact: { type: boolean }
+        receiver_verified: { type: boolean }
+        receiver_name: { type: string }
+    HandoverScan:
+      type: object
+      properties:
+        id: { type: integer }
+        handover_id: { type: integer }
+        box_no: { type: string }
+        result: { type: string, enum: [ok, wrong_box, duplicate] }
+        temp_c: { type: number }
+        seal_intact: { type: boolean }
+        message: { type: string }
+        scanned_at: { type: string, format: date-time }
+    DeliveryPlanRequest:
+      type: object
+      required: [vehicle_plate, driver_name, stops]
+      properties:
+        vehicle_plate: { type: string }
+        driver_name: { type: string }
+        cold_chain: { type: boolean }
+        stops:
+          type: array
+          items:
+            type: object
+            required: [seq, recipient_type, site_name, planned_boxes]
+            properties:
+              seq: { type: integer }
+              recipient_type: { type: string, example: community_kitchen }
+              site_name: { type: string }
+              address: { type: string }
+              lat: { type: number }
+              lng: { type: number }
+              planned_boxes: { type: integer }
+    DeliveryPlan:
+      type: object
+      properties:
+        id: { type: integer }
+        reservation_id: { type: integer }
+        vehicle_plate: { type: string }
+        driver_name: { type: string }
+        cold_chain: { type: boolean }
+        submitted_at: { type: string, format: date-time }
+    DeliveryStop:
+      type: object
+      properties:
+        id: { type: integer }
+        seq: { type: integer }
+        recipient_type: { type: string }
+        site_name: { type: string }
+        planned_boxes: { type: integer }
+        status: { type: string, enum: [planned, completed] }
+    Distribution:
+      type: object
+      properties:
+        id: { type: integer }
+        stop_id: { type: integer }
+        reservation_id: { type: integer }
+        boxes: { type: integer }
+        receiver_sign: { type: string }
+        distributed_at: { type: string, format: date-time }
+        feedback_status: { type: string, enum: [none, ok, spoiled] }
+        feedback_note: { type: string }
+    Voucher:
+      type: object
+      properties:
+        id: { type: integer }
+        batch_id: { type: integer }
+        type:
+          type: string
+          enum: [source, reservation, confirmation, handover, delivery, distribution, exception, closure]
+        payload: { type: object, additionalProperties: true }
+        hash: { type: string }
+        prev_hash: { type: string }
+        created_at: { type: string, format: date-time }
+    Exception:
+      type: object
+      properties:
+        id: { type: integer }
+        ex_no: { type: string }
+        batch_id: { type: integer }
+        reservation_id: { type: integer }
+        type:
+          type: string
+          enum: [sold_out, expired, truck_late, no_show, wrong_scan, allergen_missing, spoilage_report, regulatory_check, capacity_rejected, temp_breach]
+        detail: { type: object, additionalProperties: true }
+        status: { type: string, enum: [open, resolved] }
+        resolution: { type: string }
+        created_at: { type: string, format: date-time }
+    Publicity:
+      type: object
+      properties:
+        batch_no: { type: string }
+        store_name: { type: string }
+        charity_name: { type: string }
+        category: { type: string }
+        boxes: { type: integer }
+        distributed_boxes: { type: integer }
+        recipient_summary:
+          type: array
+          items:
+            type: object
+            properties:
+              recipient_type: { type: string }
+              site_name: { type: string }
+              boxes: { type: integer }
+        status: { type: string }
+        published_at: { type: string, format: date-time }
+
+security:
+  - bearerAuth: []
