@@ -1,0 +1,450 @@
+openapi: 3.0.3
+info:
+  title: 连锁烘焙门店临期食品捐赠预约冷链凭证服务
+  version: 1.0.0
+  description: >
+    门店闭店前上报可捐赠临期食品；公益机构按服务半径、接收能力、冷藏车辆、
+    受助人需求与时效规则预约批次；门店确认后生成待交接清单；取货时扫码核对
+    箱号、温度、封签、数量与接收人身份；签收后上传配送计划、登记最终发放对象；
+    每个批次具备来源/温控/交接/配送/发放五类哈希链凭证，支持监管抽查与捐赠公示对账。
+
+
+servers:
+  - url: http://localhost:8080
+    description: 本地
+
+tags:
+  - name: 认证
+  - name: 公示与查询
+  - name: 门店
+  - name: 公益机构
+  - name: 监管与平台
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        details: {}
+    LoginRequest:
+      type: object
+      required: [login, password]
+      properties:
+        login: {type: string, example: store1}
+        password: {type: string, example: "Test@1234"}
+    ItemInput:
+      type: object
+      required: [category, name, quantity, box_count, production_at, shelf_life_until, package_integrity]
+      properties:
+        category: {type: string, example: 面包}
+        name: {type: string, example: 原味吐司}
+        quantity: {type: integer, example: 40}
+        box_count: {type: integer, example: 4}
+        production_at: {type: string, format: date-time}
+        shelf_life_until: {type: string, format: date-time}
+        allergens: {type: array, items: {type: string}, example: ["小麦","麸质"]}
+        allergen_declared: {type: boolean, example: true}
+        needs_refrigeration: {type: boolean, example: false}
+        max_storage_temp_c: {type: number, example: 8.0}
+        package_integrity: {type: string, enum: [intact, repacked, damaged]}
+    ReportBatchRequest:
+      type: object
+      required: [title, pickup_deadline, items]
+      properties:
+        store_id: {type: string, format: uuid, description: 平台管理员可指定；店员强制使用所属门店}
+        title: {type: string, example: 10月4日闭店临期面包}
+        report_type: {type: string, enum: [scheduled, emergency], default: scheduled}
+        pickup_deadline: {type: string, format: date-time}
+        items: {type: array, items: {$ref: '#/components/schemas/ItemInput'}}
+    ReserveRequest:
+      type: object
+      required: [batch_id, planned_pickup_at]
+      properties:
+        batch_id: {type: string, format: uuid}
+        charity_id: {type: string, format: uuid, description: 机构员工调用时忽略，取登录归属}
+        planned_pickup_at: {type: string, format: date-time}
+        est_transit_minutes: {type: integer, example: 25}
+        demand_categories: {type: array, items: {type: string}}
+    DecisionRequest:
+      type: object
+      required: [reservation_id, decision]
+      properties:
+        reservation_id: {type: string, format: uuid}
+        decision: {type: string, enum: [confirm, reject]}
+        reason: {type: string}
+    ReceiverRequest:
+      type: object
+      required: [pickup_code, receiver_name, receiver_id]
+      properties:
+        pickup_code: {type: string, example: "483920"}
+        receiver_name: {type: string}
+        receiver_id: {type: string, example: "310101199001011234"}
+        receiver_phone: {type: string, example: "13800001111"}
+    ScanBoxRequest:
+      type: object
+      required: [box_code, checked_qty]
+      properties:
+        box_code: {type: string}
+        measured_temp_c: {type: number}
+        seal_no: {type: string}
+        checked_qty: {type: integer}
+    SignRequest:
+      type: object
+      properties:
+        party: {type: string, enum: [store, charity]}
+    TempRequest:
+      type: object
+      required: [phase, temp_c]
+      properties:
+        phase: {type: string, enum: [handover, transport, recipient]}
+        temp_c: {type: number}
+        box_code: {type: string}
+        note: {type: string}
+    StopInput:
+      type: object
+      required: [point_name, point_type, box_codes]
+      properties:
+        point_name: {type: string, example: 华阳社区救助点}
+        point_type: {type: string, example: 社区救助点}
+        longitude: {type: number}
+        latitude: {type: number}
+        eta: {type: string, format: date-time}
+        box_codes: {type: array, items: {type: string}}
+    DeliveryPlanRequest:
+      type: object
+      required: [batch_id, vehicle_plate, driver_name, cold_chain, stops]
+      properties:
+        batch_id: {type: string, format: uuid}
+        charity_id: {type: string, format: uuid}
+        vehicle_plate: {type: string, example: 沪D·L8826}
+        driver_name: {type: string}
+        cold_chain: {type: boolean}
+        stops: {type: array, items: {$ref: '#/components/schemas/StopInput'}}
+    DistributionRequest:
+      type: object
+      required: [batch_id, point_name, recipient_type, box_code, quantity]
+      properties:
+        batch_id: {type: string, format: uuid}
+        charity_id: {type: string, format: uuid}
+        stop_seq: {type: integer}
+        point_name: {type: string}
+        recipient_type: {type: string, example: 困难家庭}
+        box_code: {type: string}
+        quantity: {type: integer}
+        distributed_at: {type: string, format: date-time}
+    SpoiledRequest:
+      type: object
+      required: [point_name]
+      properties:
+        box_code: {type: string}
+        point_name: {type: string}
+        note: {type: string}
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/auth/login:
+    post:
+      tags: [认证]
+      security: []
+      summary: 登录获取令牌
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/LoginRequest'}
+      responses:
+        '200': {description: OK}
+        '401': {description: 账号或密码错误}
+
+  /api/v1/me:
+    get:
+      tags: [认证]
+      summary: 当前登录身份
+      responses:
+        '200': {description: OK}
+
+  /api/v1/ledger:
+    get:
+      tags: [公示与查询]
+      summary: 捐赠公示（库存/交接/发放结果一致的读模型）
+      parameters:
+        - {in: query, name: result, schema: {type: string, enum: [in_progress, donated, wasted, spoiled, cancelled]}}
+      responses:
+        '200': {description: OK}
+
+  /api/v1/stats:
+    get:
+      tags: [公示与查询]
+      summary: 公益效率与损耗实时统计（Redis + 公示表双份核对）
+      responses:
+        '200': {description: OK}
+
+  /api/v1/exceptions:
+    get:
+      tags: [公示与查询]
+      summary: 异常登记清单（售罄/超时/迟到/爽约/错扫/过敏原缺失/温控/变质）
+      parameters:
+        - {in: query, name: unresolved, schema: {type: boolean}}
+      responses:
+        '200': {description: OK}
+
+  /api/v1/batches/{batchID}:
+    get:
+      tags: [公示与查询]
+      summary: 批次全链路详情（品类/箱体/预约/凭证链/异常）
+      parameters:
+        - {in: path, name: batchID, required: true, schema: {type: string}}
+      responses:
+        '200': {description: OK}
+        '404': {description: 不存在}
+
+  /api/v1/batches/{batchID}/vouchers:
+    get:
+      tags: [公示与查询]
+      summary: 批次五类凭证哈希链
+      parameters:
+        - {in: path, name: batchID, required: true, schema: {type: string}}
+      responses:
+        '200': {description: OK}
+
+  /api/v1/stores/me/batches:
+    get:
+      tags: [门店]
+      summary: 本门店上报批次列表
+      responses:
+        '200': {description: OK}
+
+  /api/v1/batches/report:
+    post:
+      tags: [门店]
+      summary: 闭店前上报可捐赠食品（自动计算可捐赠时限、逐箱建档、来源凭证）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReportBatchRequest'}
+      responses:
+        '201': {description: 已上报}
+        '400': {description: 参数错误（含已过保质期/无可捐赠窗口）}
+
+  /api/v1/batches/{batchID}/decision:
+    post:
+      tags: [门店]
+      summary: 门店确认/拒绝预约（确认后生成取货码、封签与待交接清单）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DecisionRequest'}
+      responses:
+        '200': {description: OK}
+        '409': {description: 状态冲突}
+        '422': {description: 已超过可捐赠时限}
+
+  /api/v1/batches/{batchID}/verify-receiver:
+    post:
+      tags: [门店]
+      summary: 核对接收人身份与取货码
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReceiverRequest'}
+      responses:
+        '200': {description: 身份核验通过}
+        '403': {description: 取货码不匹配}
+
+  /api/v1/batches/{batchID}/scan-box:
+    post:
+      tags: [门店]
+      summary: 取货逐箱扫码核对（箱号/温度/封签/数量；错扫与异常自动登记）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ScanBoxRequest'}
+      responses:
+        '200': {description: 核对结果（scanned_ok / rejected）}
+        '404': {description: 箱号不存在（错扫登记）}
+        '422': {description: 箱号不属于本批次}
+
+  /api/v1/batches/{batchID}/complete-check:
+    post:
+      tags: [门店]
+      summary: 完成交接核对（要求无未扫箱、无阻断性异常）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: OK}
+        '422': {description: 仍有未扫箱或阻断性异常}
+
+  /api/v1/batches/{batchID}/sign:
+    post:
+      tags: [门店, 公益机构]
+      summary: 双方签收（先门店后机构；机构签收后进入运输中并生成交接/温控凭证）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SignRequest'}
+      responses:
+        '200': {description: OK}
+        '422': {description: 核对未完成/顺序错误}
+
+  /api/v1/batches/{batchID}/sold-out:
+    post:
+      tags: [门店]
+      summary: 门店临时售罄（自动撤销有效预约并公示为 wasted）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: OK}
+        '409': {description: 已确认不可直接售罄}
+
+  /api/v1/batches/{batchID}/cancel:
+    post:
+      tags: [门店]
+      summary: 无预约时撤回批次
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: OK}
+
+  /api/v1/batches/{batchID}/release:
+    post:
+      tags: [门店]
+      summary: 将机构撤销/爽约后 released 的批次重新开放预约
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: OK}
+        '422': {description: 重新开放时已过可捐赠时限，自动 expired}
+
+  /api/v1/charities/me/open-batches:
+    get:
+      tags: [公益机构]
+      summary: 可预约批次列表（含半径/运力/冷藏/需求/时效/可靠度规则预检）
+      parameters:
+        - {in: query, name: radius_only, schema: {type: boolean}}
+      responses:
+        '200': {description: OK}
+
+  /api/v1/reservations:
+    post:
+      tags: [公益机构]
+      summary: 预约批次（三重防重：Redis 锁 + 行锁 + 部分唯一索引）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ReserveRequest'}
+      responses:
+        '201': {description: 预约成功，待门店确认}
+        '409': {description: 批次已被预约（禁止重复预约）}
+        '422': {description: 资格规则未通过，details 含命中明细}
+        '429': {description: 该批次正在被并发预约}
+
+  /api/v1/reservations/{reservationID}/cancel:
+    post:
+      tags: [公益机构]
+      summary: 撤销预约（批次 released，可被重新开放）
+      parameters: [{in: path, name: reservationID, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: OK}
+
+  /api/v1/reservations/{reservationID}/arrive:
+    post:
+      tags: [公益机构]
+      summary: 冷链车到达登记（超过容忍分钟数记迟到并影响可靠度）
+      parameters: [{in: path, name: reservationID, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: OK}
+
+  /api/v1/batches/{batchID}/temperatures:
+    post:
+      tags: [公益机构]
+      summary: 运输/受助点温度登记（温控凭证数据源；超限登记 temp_breach）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TempRequest'}
+      responses:
+        '201': {description: 已记录}
+
+  /api/v1/delivery-plans:
+    post:
+      tags: [公益机构]
+      summary: 签收后上传配送计划（车辆/司机/受助点/箱体分配，生成配送凭证）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DeliveryPlanRequest'}
+      responses:
+        '201': {description: OK}
+        '422': {description: 冷链缺失/箱体重复分配/箱体不属于本批}
+
+  /api/v1/distributions:
+    post:
+      tags: [公益机构]
+      summary: 登记最终发放对象类型（逐箱闭环，全部完成后批次 distributed）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DistributionRequest'}
+      responses:
+        '201': {description: OK}
+
+  /api/v1/batches/{batchID}/spoiled-feedback:
+    post:
+      tags: [公益机构]
+      summary: 受助点反馈变质（批次 quarantined 封存，异常+凭证留痕）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SpoiledRequest'}
+      responses:
+        '200': {description: OK}
+
+  /api/v1/batches/{batchID}/inspections:
+    post:
+      tags: [监管与平台]
+      summary: 监管抽查（重算哈希链、五证完整性、公示一致性）
+      parameters: [{in: path, name: batchID, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: pass}
+        '422': {description: defect，body 含 findings}
+
+  /api/v1/inspections:
+    get:
+      tags: [监管与平台]
+      summary: 抽查记录列表
+      responses:
+        '200': {description: OK}
+
+  /api/v1/admin/reconcile:
+    post:
+      tags: [监管与平台]
+      summary: 从权威表全量重建公示与 Redis 统计
+      responses:
+        '200': {description: OK}
+
+  /api/v1/admin/sweep:
+    post:
+      tags: [监管与平台]
+      summary: 手动触发超时/爽约扫描（服务每 30 秒自动执行）
+      responses:
+        '200': {description: OK}
